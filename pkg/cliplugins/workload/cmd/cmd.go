@@ -35,6 +35,14 @@ var (
 	# Directly apply the manifest
 	%[1]s workload sync <sync-target-name> --syncer-image <kcp-syncer-image> -o - | KUBECONFIG=<pcluster-config> kubectl apply -f -
 `
+	edgeSyncExample = `
+	# Ensure a syncer is running on the specified sync target.
+	%[1]s workload edge-sync <sync-target-name> --syncer-image <kcp-syncer-image> -o edge-syncer.yaml
+	KUBECONFIG=<pcluster-config> kubectl apply -f edge-syncer.yaml
+
+	# Directly apply the manifest
+	%[1]s workload sync <sync-target-name> --syncer-image <kcp-syncer-image> -o - | KUBECONFIG=<pcluster-config> kubectl apply -f -
+`
 	cordonExample = `
 	# Mark a sync target as unschedulable.
 	%[1]s workload cordon <sync-target-name>
@@ -89,6 +97,34 @@ func New(streams genericclioptions.IOStreams) (*cobra.Command, error) {
 
 	syncOptions.BindFlags(enableSyncerCmd)
 	cmd.AddCommand(enableSyncerCmd)
+
+	// EdgeSync command
+	edgeSyncOptions := plugin.NewEdgeSyncOptions(streams)
+
+	enableEdgeSyncerCmd := &cobra.Command{
+		Use:          "edge-sync <sync-target-name> --syncer-image <kcp-syncer-image> [--resources=<resource1>,<resource2>..] -o <output-file>",
+		Short:        "Create a synctarget for Edge MC in kcp with service account and RBAC permissions. Output a manifest to deploy a syncer for the given sync target in a physical cluster.",
+		Example:      fmt.Sprintf(edgeSyncExample, "kubectl kcp"),
+		SilenceUsage: true,
+		RunE: func(c *cobra.Command, args []string) error {
+			if len(args) != 1 {
+				return c.Help()
+			}
+
+			if err := edgeSyncOptions.Complete(args); err != nil {
+				return err
+			}
+
+			if err := edgeSyncOptions.Validate(); err != nil {
+				return err
+			}
+
+			return edgeSyncOptions.Run(c.Context())
+		},
+	}
+
+	edgeSyncOptions.BindFlags(enableEdgeSyncerCmd)
+	cmd.AddCommand(enableEdgeSyncerCmd)
 
 	// Cordon command
 	cordonOpts := plugin.NewCordonOptions(streams)
