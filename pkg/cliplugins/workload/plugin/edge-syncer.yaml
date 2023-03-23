@@ -25,37 +25,18 @@ metadata:
   name: {{.ClusterRole}}
 rules:
 - apiGroups:
-  - ""
+  - "rbac.authorization.k8s.io"
   resources:
-  - namespaces
+  - clusterroles
+  - clusterrolebindings
   verbs:
-  - "create"
-  - "get"
-  - "list"
-  - "watch"
-  - "delete"
+  - "*"
 - apiGroups:
-  - ""
+  - "*"
   resources:
-  - endpoints
+  - "*"
   verbs:
-  - "get"
-- apiGroups:
-  - "apiextensions.k8s.io"
-  resources:
-  - customresourcedefinitions
-  verbs:
-  - "get"
-  - "watch"
-  - "list"
-- apiGroups:
-  - "networking.k8s.io"
-  resources:
-  - networkpolicies
-  verbs:
-  - "create"
-  - "list"
-  - "watch"
+  - "*"
 {{- range $groupMapping := .GroupMappings}}
 - apiGroups:
   - "{{$groupMapping.APIGroup}}"
@@ -87,48 +68,18 @@ metadata:
   namespace: {{.Namespace}}
 rules:
 - apiGroups:
-  - ""
-  resources:
-  - serviceaccounts
-  - services
-  verbs:
-  - "create"
-  - "get"
-  - "list"
-  - "update"
-  - "delete"
-  - "watch"
-- apiGroups:
-  - ""
-  resources:
-  - endpoints
-  verbs:
-  - "get"
-  - "list"
-  - "watch"
-- apiGroups:
-  - "apps"
-  resources:
-  - deployments
-  verbs:
-  - "create"
-  - "get"
-  - "list"
-  - "update"
-  - "delete"
-  - "watch"
-- apiGroups:
-  - "rbac.authorization.k8s.io"
+  - rbac.authorization.k8s.io/v1
   resources:
   - roles
   - rolebindings
   verbs:
-  - "create"
-  - "get"
-  - "list"
-  - "update"
-  - "delete"
-  - "watch"
+  - "*"
+- apiGroups:
+  - "*"
+  resources:
+  - "*"
+  verbs:
+  - "*"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -196,17 +147,9 @@ spec:
         - --sync-target-name={{.SyncTarget}}
         - --sync-target-uid={{.SyncTargetUID}}
         - --from-cluster={{.SyncTargetPath}}
-        - --api-import-poll-interval={{ .APIImportPollIntervalString }}
-        - --downstream-namespace-clean-delay={{ .DownstreamNamespaceCleanDelayString }}
-{{- range $resourceToSync := .ResourcesToSync}}
-        - --resources={{$resourceToSync}}
-{{- end}}
         - --qps={{.QPS}}
         - --burst={{.Burst}}
-{{- if .FeatureGatesString }}
-        - --feature-gates={{ .FeatureGatesString }}
-{{- end}}
-        - --dns-image={{.Image}}
+        - --v=3
         env:
         - name: NAMESPACE
           valueFrom:

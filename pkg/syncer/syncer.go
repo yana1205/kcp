@@ -154,7 +154,6 @@ func StartSyncer(ctx context.Context, cfg *SyncerConfig, numSyncerThreads int, i
 	if err != nil {
 		return err
 	}
-
 	upstreamUpsyncConfig := rest.CopyConfig(cfg.UpstreamConfig)
 	upstreamUpsyncConfig.Host = upsyncerVirtualWorkspaceURL
 	rest.AddUserAgent(upstreamUpsyncConfig, "kcp#upsyncing/"+kcpVersion)

@@ -32,27 +32,33 @@ import (
 	"time"
 
 	jsonpatch "github.com/evanphx/json-patch"
+	"github.com/google/uuid"
 	"github.com/kcp-dev/logicalcluster/v3"
 	"github.com/martinlindhe/base36"
 	"github.com/spf13/cobra"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
+	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apix "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/klog/v2"
 	"k8s.io/kube-openapi/pkg/util/sets"
 
-	apiresourcev1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apiresource/v1alpha1"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	workloadv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/workload/v1alpha1"
 	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
 	"github.com/kcp-dev/kcp/pkg/cliplugins/base"
 	"github.com/kcp-dev/kcp/pkg/cliplugins/helpers"
@@ -219,10 +225,8 @@ func (o *EdgeSyncOptions) Run(ctx context.Context) error {
 		return err
 	}
 
-	expectedResourcesForPermission, err := o.getResourcesForPermission(ctx, config, o.SyncTargetName)
-	if err != nil {
-		return err
-	}
+	// TODO: For now, set nothing but in future, need the list of resources to be synced/upsynced. For EMC Syncer, we assume there come from Edge Placement
+	expectedResourcesForPermission := sets.NewString()
 
 	configURL, _, err := helpers.ParseClusterURL(config.Host)
 	if err != nil {
@@ -290,99 +294,37 @@ func (o *EdgeSyncOptions) Run(ctx context.Context) error {
 
 // getEdgeSyncerID returns a unique ID for a syncer derived from the name and its UID. It's
 // a valid DNS segment and can be used as namespace or object names.
-func getEdgeSyncerID(syncTarget *workloadv1alpha1.SyncTarget) string {
+func getEdgeSyncerID(syncTarget *typeEdgeSyncTarget) string {
 	syncerHash := sha256.Sum224([]byte(syncTarget.UID))
 	base36hash := strings.ToLower(base36.EncodeBytes(syncerHash[:]))
-	return fmt.Sprintf("kcp-syncer-%s-%s", syncTarget.Name, base36hash[:8])
+	return fmt.Sprintf("kcp-edge-syncer-%s-%s", syncTarget.Name, base36hash[:8])
 }
 
-func (o *EdgeSyncOptions) applySyncTarget(ctx context.Context, kcpClient kcpclient.Interface, syncTargetName string, labels map[string]string) (*workloadv1alpha1.SyncTarget, error) {
-	supportedAPIExports := make([]tenancyv1alpha1.APIExportReference, 0, len(o.APIExports))
-	for _, export := range o.APIExports {
-		lclusterName, name := logicalcluster.NewPath(export).Split()
-		supportedAPIExports = append(supportedAPIExports, tenancyv1alpha1.APIExportReference{
-			Export: name,
-			Path:   lclusterName.String(),
-		})
-	}
+type typeEdgeSyncTarget struct {
+	UID         types.UID
+	Name        string
+	Annotations map[string]string
+}
 
-	// if ResourcesToSync is not empty, add export in synctarget workspace.
-	if len(o.ResourcesToSync) > 0 && !sets.NewString(o.APIExports...).Has("kubernetes") {
-		supportedAPIExports = append(supportedAPIExports, tenancyv1alpha1.APIExportReference{
-			Export: "kubernetes",
-		})
-	}
+func (o *typeEdgeSyncTarget) GetAnnotations() map[string]string {
+	return o.Annotations
+}
 
-	syncTarget, err := kcpClient.WorkloadV1alpha1().SyncTargets().Get(ctx, syncTargetName, metav1.GetOptions{})
-
-	switch {
-	case apierrors.IsNotFound(err):
-		// Create the sync target that will serve as a point of coordination between
-		// kcp and the syncer (e.g. heartbeating from the syncer and virtual cluster urls
-		// to the syncer).
-		fmt.Fprintf(o.ErrOut, "Creating synctarget %q\n", syncTargetName)
-		syncTarget, err = kcpClient.WorkloadV1alpha1().SyncTargets().Create(ctx,
-			&workloadv1alpha1.SyncTarget{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:   syncTargetName,
-					Labels: labels,
-				},
-				Spec: workloadv1alpha1.SyncTargetSpec{
-					SupportedAPIExports: supportedAPIExports,
-				},
-			},
-			metav1.CreateOptions{},
-		)
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("failed to create synctarget %q: %w", syncTargetName, err)
-		}
-		if err == nil {
-			return syncTarget, nil
-		}
-	case err != nil:
-		return nil, err
-	}
-
-	if equality.Semantic.DeepEqual(labels, syncTarget.ObjectMeta.Labels) && equality.Semantic.DeepEqual(supportedAPIExports, syncTarget.Spec.SupportedAPIExports) {
-		return syncTarget, nil
-	}
-
-	// Patch synctarget with updated exports
-	oldData, err := json.Marshal(workloadv1alpha1.SyncTarget{
-		ObjectMeta: metav1.ObjectMeta{
-			Labels: syncTarget.ObjectMeta.Labels,
-		},
-		Spec: workloadv1alpha1.SyncTargetSpec{
-			SupportedAPIExports: syncTarget.Spec.SupportedAPIExports,
-		},
-	})
+func (o *EdgeSyncOptions) applySyncTarget(ctx context.Context, kcpClient kcpclient.Interface, syncTargetName string, labels map[string]string) (*typeEdgeSyncTarget, error) {
+	logicalCluster, err := kcpClient.CoreV1alpha1().LogicalClusters().Get(ctx, "cluster", metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to Marshal old data for syncTarget %s: %w", syncTargetName, err)
+		return nil, fmt.Errorf("failed to get default logical cluster %q: %w", syncTargetName, err)
 	}
-
-	newData, err := json.Marshal(workloadv1alpha1.SyncTarget{
-		ObjectMeta: metav1.ObjectMeta{
-			UID:             syncTarget.UID,
-			ResourceVersion: syncTarget.ResourceVersion,
-			Labels:          labels,
-		}, // to ensure they appear in the patch as preconditions
-		Spec: workloadv1alpha1.SyncTargetSpec{
-			SupportedAPIExports: supportedAPIExports,
-		},
-	})
+	uuid, err := uuid.NewUUID()
 	if err != nil {
-		return nil, fmt.Errorf("failed to Marshal new data for syncTarget %s: %w", syncTargetName, err)
+		return nil, fmt.Errorf("failed to generate UUID %q: %w", syncTargetName, err)
 	}
-
-	patchBytes, err := jsonpatch.CreateMergePatch(oldData, newData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create merge patch for syncTarget %q because: %w", syncTargetName, err)
+	edgeSyncTarget := typeEdgeSyncTarget{
+		UID:         types.UID(uuid.String()),
+		Name:        syncTargetName,
+		Annotations: logicalCluster.Annotations,
 	}
-
-	if syncTarget, err = kcpClient.WorkloadV1alpha1().SyncTargets().Patch(ctx, syncTargetName, types.MergePatchType, patchBytes, metav1.PatchOptions{}); err != nil {
-		return nil, fmt.Errorf("failed to patch syncTarget %s: %w", syncTargetName, err)
-	}
-	return syncTarget, nil
+	return &edgeSyncTarget, nil
 }
 
 // getResourcesForPermission get all resources to sync from syncTarget status and resources flags. It is used to generate the rbac on
@@ -432,7 +374,7 @@ func (o *EdgeSyncOptions) getResourcesForPermission(ctx context.Context, config 
 // enableSyncerForWorkspace creates a sync target with the given name and creates a service
 // account for the syncer in the given namespace. The expectation is that the provided config is
 // for a logical cluster (workspace). Returns the token the syncer will use to connect to kcp.
-func (o *EdgeSyncOptions) enableSyncerForWorkspace(ctx context.Context, config *rest.Config, syncTargetName, namespace string, labels map[string]string) (saToken string, syncerID string, syncTarget *workloadv1alpha1.SyncTarget, err error) {
+func (o *EdgeSyncOptions) enableSyncerForWorkspace(ctx context.Context, config *rest.Config, syncTargetName, namespace string, labels map[string]string) (saToken string, syncerID string, syncTarget *typeEdgeSyncTarget, err error) {
 	kcpClient, err := kcpclient.NewForConfig(config)
 	if err != nil {
 		return "", "", nil, fmt.Errorf("failed to create kcp client: %w", err)
@@ -448,13 +390,52 @@ func (o *EdgeSyncOptions) enableSyncerForWorkspace(ctx context.Context, config *
 		return "", "", nil, fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
-	syncerID = getEdgeSyncerID(syncTarget)
+	apixClientSet, err := apix.NewForConfig(config)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("failed to create apiextension kubernetes client: %w", err)
+	}
+	crdByte, err := embeddedResources.ReadFile("edge.kcp.io_edgesyncconfigs.yaml")
+	if err != nil {
+		return "", "", nil, fmt.Errorf("failed to load edgeSyncConfig CRD yaml: %w", err)
+	}
+	decoder := yaml.NewYAMLToJSONDecoder(bytes.NewReader(crdByte))
 
+	var u unstructured.Unstructured
+	err = decoder.Decode(&u)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("failed to decode edgeSyncConfig CRD yaml: %w", err)
+	}
+	var crd apixv1.CustomResourceDefinition
+	err = runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &crd)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("failed to convert to edgeSyncConfig CRD: %w", err)
+	}
+
+	_, err = apixClientSet.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crd.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, err = apixClientSet.ApiextensionsV1().CustomResourceDefinitions().Create(ctx, &crd, metav1.CreateOptions{})
+		if err != nil {
+			return "", "", nil, fmt.Errorf("failed to create edgeSyncConfig CRD: %w", err)
+		}
+	}
+
+	var syncConfig *unstructured.Unstructured
+	if err := wait.PollImmediateInfiniteWithContext(ctx, time.Second*1, func(ctx context.Context) (bool, error) {
+		syncConfig, err = createEdgeSyncConfig(ctx, config, syncTargetName)
+		if err != nil {
+			_ = err
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		return "", "", nil, fmt.Errorf("failed to get or create EdgeSyncConfig resource: %w", err)
+	}
+	syncerID = getEdgeSyncerID(syncTarget)
 	syncTargetOwnerReferences := []metav1.OwnerReference{{
-		APIVersion: workloadv1alpha1.SchemeGroupVersion.String(),
-		Kind:       "SyncTarget",
-		Name:       syncTarget.Name,
-		UID:        syncTarget.UID,
+		APIVersion: syncConfig.GetAPIVersion(),
+		Kind:       syncConfig.GetKind(),
+		Name:       syncConfig.GetName(),
+		UID:        syncConfig.GetUID(),
 	}}
 	sa, err := kubeClient.CoreV1().ServiceAccounts(namespace).Get(ctx, syncerID, metav1.GetOptions{})
 
@@ -508,33 +489,9 @@ func (o *EdgeSyncOptions) enableSyncerForWorkspace(ctx context.Context, config *
 	// workspace to sync.
 	rules := []rbacv1.PolicyRule{
 		{
-			Verbs:         []string{"sync"},
-			APIGroups:     []string{workloadv1alpha1.SchemeGroupVersion.Group},
-			ResourceNames: []string{syncTargetName},
-			Resources:     []string{"synctargets"},
-		},
-		{
-			Verbs:         []string{"get"},
-			APIGroups:     []string{workloadv1alpha1.SchemeGroupVersion.Group},
-			ResourceNames: []string{syncTargetName},
-			Resources:     []string{"synctargets/tunnel"},
-		},
-		{
-			Verbs:         []string{"get", "list", "watch"},
-			APIGroups:     []string{workloadv1alpha1.SchemeGroupVersion.Group},
-			Resources:     []string{"synctargets"},
-			ResourceNames: []string{syncTargetName},
-		},
-		{
-			Verbs:         []string{"update", "patch"},
-			APIGroups:     []string{workloadv1alpha1.SchemeGroupVersion.Group},
-			ResourceNames: []string{syncTargetName},
-			Resources:     []string{"synctargets/status"},
-		},
-		{
-			Verbs:     []string{"get", "create", "update", "delete", "list", "watch"},
-			APIGroups: []string{apiresourcev1alpha1.SchemeGroupVersion.Group},
-			Resources: []string{"apiresourceimports"},
+			Verbs:     []string{"*"},
+			APIGroups: []string{"*"},
+			Resources: []string{"*"},
 		},
 		{
 			Verbs:           []string{"access"},
@@ -859,4 +816,43 @@ func sortGroupMappingsForEdge(groupMappings []groupMappingForEdge) {
 		}
 		return groupMappings[i].APIGroup < groupMappings[j].APIGroup
 	})
+}
+
+func createEdgeSyncConfig(ctx context.Context, cfg *rest.Config, syncTargetName string) (*unstructured.Unstructured, error) {
+	dyClient, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client :%w", err)
+	}
+	discoveryClient := discovery.NewDiscoveryClientForConfigOrDie(cfg)
+	gk := schema.GroupKind{
+		Group: "edge.kcp.io",
+		Kind:  "EdgeSyncConfig",
+	}
+	groupResources, err := restmapper.GetAPIGroupResources(discoveryClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get API group resources :%w", err)
+	}
+	restMapper := restmapper.NewDiscoveryRESTMapper(groupResources)
+	mapping, err := restMapper.RESTMapping(gk, "v1alpha1")
+	if err != nil || mapping == nil {
+		return nil, fmt.Errorf("failed to get resource mapping :%w", err)
+	}
+	cr, err := dyClient.Resource(mapping.Resource).Get(ctx, syncTargetName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		cr = &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": gk.Group + "/v1alpha1",
+			"kind":       gk.Kind,
+			"metadata": map[string]interface{}{
+				"name": syncTargetName,
+			},
+			"spec": map[string]interface{}{},
+		}}
+		cr, err := dyClient.Resource(mapping.Resource).Create(ctx, cr, metav1.CreateOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create EdgeSyncConfig :%w", err)
+		}
+		return cr, nil
+	} else {
+		return cr, nil
+	}
 }
